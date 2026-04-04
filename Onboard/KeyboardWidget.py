@@ -26,10 +26,10 @@ from __future__ import division, print_function, unicode_literals
 import sys
 import time
 from math import sin, pi
+from gi.repository          import GLib, Gdk, Gtk
 
 from Onboard.Version import require_gi_versions
 require_gi_versions()
-from gi.repository          import GLib, Gdk, Gtk
 
 from Onboard.TouchInput     import TouchInput, InputSequence
 from Onboard.Keyboard       import EventType
@@ -358,6 +358,9 @@ class KeyboardWidget(Gtk.DrawingArea, WindowManipulatorAspectRatio,
         self._update_double_click_time()
 
         self._hovered_key = False
+        # Pointer recovery state
+        self._pointer_poll_id = None
+        self._last_pointer_inside = None
         self.connect("motion-notify-event", self.on_motion)
         self.connect("leave-notify-event", self.on_mouse_leave)
         self.set_events(Gdk.EventMask.POINTER_MOTION_MASK |
@@ -575,6 +578,7 @@ class KeyboardWidget(Gtk.DrawingArea, WindowManipulatorAspectRatio,
         Temporarily presents the window with active transparency when
         inactive transparency is enabled.
         """
+        self._start_pointer_polling()
         self.transition_active_to(True)
         self.commit_transition()
         if self.inactivity_timer.is_enabled():
@@ -760,21 +764,26 @@ class KeyboardWidget(Gtk.DrawingArea, WindowManipulatorAspectRatio,
         window = self.get_kbd_window()
         if window:
             self.set_opacity(opacity)
+        # Pointer recovery activation if transparent
+        if opacity < 0.99:
+            self._start_pointer_polling()
+        else:
+            self._stop_pointer_polling()
 
-            visible_before = window.is_visible()
-            visible_later  = state.target_visibility
+        visible_before = window.is_visible()
+        visible_later  = state.target_visibility
 
-            # move
-            x = int(state.x.value)
-            y = int(state.y.value)
-            wx, wy = window.get_position()
-            if x != wx or y != wy:
-                window.reposition(x, y)
+        # move
+        x = int(state.x.value)
+        y = int(state.y.value)
+        wx, wy = window.get_position()
+        if x != wx or y != wy:
+            window.reposition(x, y)
 
-            # show/hide
-            visible = (visible_before or visible_later) and not done or \
-                      visible_later and done
-            if window.is_visible() != visible:
+        # show/hide
+        visible = (visible_before or visible_later) and not done or \
+                  visible_later and done
+        if window.is_visible() != visible:
                 window.set_visible(visible)
 
                 # on_leave_notify does not start the inactivity timer
@@ -787,8 +796,8 @@ class KeyboardWidget(Gtk.DrawingArea, WindowManipulatorAspectRatio,
                 # start/stop on-hide-release timer
                 self._auto_release_timer.start(visible)
 
-            if done:
-                window.on_transition_done(visible_before, visible_later)
+        if done:
+            window.on_transition_done(visible_before, visible_later)
 
         return not done
 
@@ -1462,6 +1471,59 @@ class KeyboardWidget(Gtk.DrawingArea, WindowManipulatorAspectRatio,
                 return False
         return True
 
+    # --- POINTER RECOVERY FIX ---
+    def _start_pointer_polling(self):
+        if getattr(self, "_pointer_poll_id", None) is None:
+            self._pointer_poll_id = GLib.timeout_add(
+                120, self._pointer_poll_cb
+            )
+
+    def _stop_pointer_polling(self):
+        if getattr(self, "_pointer_poll_id", None) is not None:
+            GLib.source_remove(self._pointer_poll_id)
+            self._pointer_poll_id = None
+
+    def _pointer_poll_cb(self):
+        try:
+            window = self.get_window()
+            if not window:
+                return True
+
+            display = Gdk.Display.get_default()
+            seat = display.get_default_seat()
+            device = seat.get_pointer()
+            screen, x, y = device.get_position()
+            wx, wy = window.get_root_coords(0, 0)
+            alloc = self.get_allocation()
+
+            inside = (
+                wx <= x <= wx + alloc.width and
+                wy <= y <= wy + alloc.height
+            )
+
+            last = getattr(self, "_last_pointer_inside", None)
+
+            if last is None:
+                self._last_pointer_inside = inside
+                return True
+
+            # correct lost events
+            if inside and not last:
+                self.keyboard.on_activity_detected()
+                if self.inactivity_timer.is_enabled():
+                    self.inactivity_timer.begin_transition(True)
+
+            elif not inside and last:
+                if self.inactivity_timer.is_enabled():
+                    self.inactivity_timer.begin_transition(False)
+
+            self._last_pointer_inside = inside
+
+        except Exception:
+            pass
+
+        return True
+        
     def get_kbd_window(self):
         return self.get_parent()
 
